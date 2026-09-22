@@ -29,6 +29,27 @@
         "Lampasas"
       ],
       "default": "Leander"
+    },
+    "override_flag": {
+      "title": "Override reporting date",
+      "type": "string",
+      "editor": "select",
+      "description": "Choose TRUE to calculate the reporting week from Override date. FALSE uses today's date.",
+      "enum": [
+        "TRUE",
+        "FALSE"
+      ],
+      "default": "FALSE",
+      "sectionCaption": "Reporting week",
+      "sectionDescription": "Leave the override on FALSE to use today's date. Choose TRUE to calculate the week from a specific date."
+    },
+    "override_date": {
+      "title": "Override date",
+      "type": "string",
+      "editor": "datepicker",
+      "description": "Used as today's date when Override reporting date is on. The report still covers the Monday–Sunday week for that date. If the date is a Monday, the previous week is used.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "nullable": true
     }
   },
   "required": [

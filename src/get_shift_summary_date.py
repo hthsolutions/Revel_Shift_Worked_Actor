@@ -4,7 +4,22 @@ import sys
 from datetime import datetime, timedelta
 
 
-def revel_date_field_shift(storename):
+def parse_override_flag(value):
+    normalized = str(value).strip().lower()
+
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+
+    raise ValueError(
+        "override_flag must be true or false. "
+        f"Received: {value}"
+    )
+
+
+def revel_date_field_shift(storename, override_flag, override_date):
     """Returns the date of the last Monday as a string."""
 
     store_name = re.sub(
@@ -18,8 +33,25 @@ def revel_date_field_shift(storename):
             "A location name is required."
         )
 
-    today_date = datetime.now()
-    today_date = datetime(2026, 9, 17, 14, 30, 0)
+    if override_flag:
+        if not override_date or not str(override_date).strip():
+            raise ValueError(
+                "override_date is required when "
+                "override_flag is true."
+            )
+
+        try:
+            today_date = datetime.strptime(
+                str(override_date).strip(),
+                "%Y-%m-%d",
+            )
+        except ValueError as error:
+            raise ValueError(
+                "override_date must use YYYY-MM-DD. "
+                f"Received: {override_date}"
+            ) from error
+    else:
+        today_date = datetime.now()
 
     if today_date.strftime("%A") == "Monday":
         last_monday_date = today_date - timedelta(days=7)
@@ -68,11 +100,25 @@ def revel_date_field_shift(storename):
 if __name__ == "__main__":
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         raise SystemExit(
-            "Usage: get_shift_summary_date.py <location>"
+            "Usage: get_shift_summary_date.py "
+            "<location> [override_flag] [override_date]"
         )
 
+    override_flag = False
+    override_date = None
+
+    if len(sys.argv) >= 3:
+        override_flag = parse_override_flag(
+            sys.argv[2]
+        )
+
+    if len(sys.argv) >= 4 and sys.argv[3].strip():
+        override_date = sys.argv[3].strip()
+
     results = revel_date_field_shift(
-        sys.argv[1]
+        sys.argv[1],
+        override_flag,
+        override_date,
     )
 
     print(

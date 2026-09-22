@@ -184,8 +184,18 @@ function parseInputDate(value) {
  * ---------------------------------------------------------
  */
 
+function isOverrideEnabled(value) {
+    return String(value ?? '')
+        .trim()
+        .toLowerCase()
+        === 'true';
+}
+
+
 async function getSummaryShiftDateFromPython(
     storename,
+    overrideFlag = false,
+    overrideDate = '',
 ) {
     /*
      * Verify the Python script exists.
@@ -219,9 +229,36 @@ async function getSummaryShiftDateFromPython(
         );
     }
 
+    const useOverrideDate =
+        isOverrideEnabled(overrideFlag);
+
+    const overrideDateValue =
+        String(overrideDate ?? '').trim();
+
+    if (
+        useOverrideDate
+        && !/^\d{4}-\d{2}-\d{2}$/.test(
+            overrideDateValue,
+        )
+    ) {
+        throw new Error(
+            'override_date is required when '
+            + 'override_flag is enabled, and it must '
+            + 'use YYYY-MM-DD. '
+            + `Received: ${overrideDateValue || '(empty)'}`,
+        );
+    }
+
     log.info(
         'Running get_shift_summary_date.py '
-        + `for ${locationName}...`,
+        + `for ${locationName}. `
+        + `override_flag=${useOverrideDate}`
+        + (
+            useOverrideDate
+                ? `, override_date=${overrideDateValue}`
+                : ''
+        )
+        + '.',
     );
 
     let pythonResult;
@@ -233,6 +270,12 @@ async function getSummaryShiftDateFromPython(
                 [
                     GET_SHIFT_SUMMARY_DATE_PATH,
                     locationName,
+                    useOverrideDate
+                        ? 'true'
+                        : 'false',
+                    useOverrideDate
+                        ? overrideDateValue
+                        : '',
                 ],
                 {
                     timeout:
@@ -1119,6 +1162,8 @@ try {
         username,
         password,
         establishment,
+        override_flag: overrideFlag = false,
+        override_date: overrideDate = '',
     } = input ?? {};
 
     log.info(
@@ -1130,7 +1175,15 @@ try {
             hasPassword:
                 Boolean(password),
 
-            establishment
+            establishment,
+
+            overrideFlag:
+                isOverrideEnabled(overrideFlag)
+                    ? 'TRUE'
+                    : 'FALSE',
+
+            overrideDate:
+                overrideDate || null,
         },
     );
 
@@ -1172,6 +1225,8 @@ try {
     const revelDateFieldShift =
         await getSummaryShiftDateFromPython(
             targetEstablishment,
+            overrideFlag,
+            overrideDate,
         );
 
     log.info(
