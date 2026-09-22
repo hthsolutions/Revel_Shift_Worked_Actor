@@ -1,0 +1,34 @@
+{
+  "$schema": "https://apify.com/schemas/v1/input.ide.json",
+  "title": "Layne's Revel Employee Time Worked",
+  "description": "Download weekly employee time worked data from Revel. The reporting week is automatically determined by get_summary_shift_date.py.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "username": {
+      "title": "Revel Username",
+      "type": "string",
+      "editor": "textfield",
+      "description": "Username used to log into Revel."
+    },
+    "password": {
+      "title": "Revel Password",
+      "type": "string",
+      "editor": "textfield",
+      "description": "Password used to log into Revel.",
+      "isSecret": true
+    },
+    "establishment": {
+      "title": "Location",
+      "type": "string",
+      "editor": "textfield",
+      "description": "Revel establishment/location name.",
+      "default": "Leander"
+    }
+  },
+  "required": [
+    "username",
+    "password",
+    "establishment"
+  ]
+}
