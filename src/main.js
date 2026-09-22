@@ -1662,43 +1662,25 @@ try {
                     await establishmentOption.click();
 
                     /*
-                    * Wait for Revel to update the establishment
-                    * header after the click.
+                    * Wait until the header locator shows the
+                    * requested store. This is the same locator
+                    * that read the pre-click header. An in-page
+                    * document.querySelector cannot see that node,
+                    * so it kept timing out after the switch had
+                    * already completed.
                     */
-                    await page.waitForFunction(
-                        ({
-                            expectedEstablishment,
-                        }) => {
-                            const header =
-                                document.querySelector(
-                                    '[data-cy="header-establishment-text"]',
-                                );
-
-                            const text =
-                                (
-                                    header?.textContent
-                                    ?? ''
-                                )
-                                    .trim()
-                                    .toLowerCase();
-
-                            return text.includes(
-                                expectedEstablishment
-                                    .toLowerCase(),
-                            );
-                        },
-                        {
-                            expectedEstablishment:
+                    await establishmentText
+                        .filter({
+                            hasText:
                                 targetEstablishment,
-                        },
-                        {
+                        })
+                        .waitFor({
+                            state:
+                                'visible',
+
                             timeout:
                                 30_000,
-
-                            polling:
-                                500,
-                        },
-                    );
+                        });
 
                     await page.waitForTimeout(
                         1_000,
