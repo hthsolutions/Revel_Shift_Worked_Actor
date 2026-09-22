@@ -184,7 +184,9 @@ function parseInputDate(value) {
  * ---------------------------------------------------------
  */
 
-async function getSummaryShiftDateFromPython() {
+async function getSummaryShiftDateFromPython(
+    storename,
+) {
     /*
      * Verify the Python script exists.
      */
@@ -207,8 +209,19 @@ async function getSummaryShiftDateFromPython() {
         );
     }
 
+    const locationName =
+        String(storename ?? '').trim();
+
+    if (!locationName) {
+        throw new Error(
+            'A location is required before running '
+            + 'get_shift_summary_date.py.',
+        );
+    }
+
     log.info(
-        'Running get_shift_summary_date.py...',
+        'Running get_shift_summary_date.py '
+        + `for ${locationName}...`,
     );
 
     let pythonResult;
@@ -219,6 +232,7 @@ async function getSummaryShiftDateFromPython() {
                 'python3',
                 [
                     GET_SHIFT_SUMMARY_DATE_PATH,
+                    locationName,
                 ],
                 {
                     timeout:
@@ -1104,7 +1118,7 @@ try {
     const {
         username,
         password,
-        establishment = 'Leander'
+        establishment,
     } = input ?? {};
 
     log.info(
@@ -1156,7 +1170,9 @@ try {
     */
 
     const revelDateFieldShift =
-        await getSummaryShiftDateFromPython();
+        await getSummaryShiftDateFromPython(
+            targetEstablishment,
+        );
 
     log.info(
         'Using Python revel_date_field_shift: '

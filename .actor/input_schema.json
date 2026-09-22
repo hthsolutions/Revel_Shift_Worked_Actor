@@ -21,8 +21,13 @@
     "establishment": {
       "title": "Location",
       "type": "string",
-      "editor": "textfield",
-      "description": "Revel establishment/location name.",
+      "editor": "select",
+      "description": "Revel establishment to download.",
+      "enum": [
+        "Leander",
+        "Marble Falls",
+        "Lampasas"
+      ],
       "default": "Leander"
     }
   },
