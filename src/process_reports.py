@@ -160,9 +160,72 @@ def prepare_supabase_records(df):
     )
 
 
-def write_to_supabase(df):
+def parse_week_boundary(value, label):
     """
-    Upserts the final processed dataframe into Supabase in batches.
+    Normalizes a week boundary to the YYYY-MM-DD form used by the
+    Supabase date column.
+    """
+    try:
+        return datetime.strptime(
+            str(value).strip(),
+            "%Y-%m-%d",
+        ).strftime("%Y-%m-%d")
+    except ValueError as error:
+        raise ValueError(
+            f"{label} must use YYYY-MM-DD. "
+            f"Received: {value}"
+        ) from error
+
+
+def purge_supabase_week(
+    client,
+    location,
+    week_start,
+    week_end,
+):
+    """
+    Deletes this location's existing rows for the reporting week.
+
+    An upsert alone cannot remove rows that are no longer in the report,
+    such as a shift that was deleted in Revel or re-keyed because its
+    start time, role, or payroll ID changed. Those rows would otherwise
+    survive forever as orphans.
+    """
+    print(
+        f"Supabase: purging existing {location} rows "
+        f"from {week_start} through {week_end}."
+    )
+
+    response = (
+        client
+        .table(SUPABASE_TABLE)
+        .delete()
+        .eq("location", location)
+        .gte("date", week_start)
+        .lte("date", week_end)
+        .execute()
+    )
+
+    purged = len(response.data or [])
+
+    print(
+        f"Supabase: purged {purged} existing rows."
+    )
+
+    return purged
+
+
+def write_to_supabase(
+    df,
+    location,
+    week_start=None,
+    week_end=None,
+):
+    """
+    Replaces the reporting week for one location in Supabase.
+
+    Existing rows for the location/week are purged first, then the final
+    processed dataframe is upserted in batches.
 
     Required Apify runtime environment variables:
         SUPABASE_URL
@@ -182,9 +245,37 @@ def write_to_supabase(df):
             "SUPABASE_SERVICE_ROLE_KEY"
         )
 
+    location_name = str(location or "").strip()
+
+    if not location_name:
+        raise ValueError(
+            "A location is required before writing to Supabase."
+        )
+
+    # An empty dataframe means the report produced nothing, which is far
+    # more likely to be a parsing failure than a week with zero shifts.
+    # Returning early keeps that case from purging good rows.
     if df.empty:
-        print("Supabase: no rows to upload.")
+        print(
+            "Supabase: no rows to upload. "
+            "Skipping purge and upsert."
+        )
         return 0
+
+    # The purge filters on location, so it has to match the value being
+    # written byte for byte. A mismatch would quietly delete nothing and
+    # leave stale rows behind.
+    written_locations = sorted({
+        str(value)
+        for value in df["Location"].dropna().unique()
+    })
+
+    if written_locations != [location_name]:
+        raise ValueError(
+            "Location mismatch between the purge filter and the rows "
+            f"being written. Purge uses {location_name!r} but the data "
+            f"contains {written_locations!r}."
+        )
 
     records = prepare_supabase_records(df)
 
@@ -192,6 +283,35 @@ def write_to_supabase(df):
         supabase_url,
         supabase_key,
     )
+
+    if week_start and week_end:
+        purge_start = parse_week_boundary(
+            week_start,
+            "week_start",
+        )
+
+        purge_end = parse_week_boundary(
+            week_end,
+            "week_end",
+        )
+
+        if purge_start > purge_end:
+            raise ValueError(
+                "week_start must not be after week_end. "
+                f"Received: {purge_start} through {purge_end}"
+            )
+
+        purge_supabase_week(
+            client,
+            location_name,
+            purge_start,
+            purge_end,
+        )
+    else:
+        print(
+            "Supabase: no reporting week supplied. "
+            "Skipping purge and relying on the upsert alone."
+        )
 
     total_uploaded = 0
 
@@ -915,6 +1035,18 @@ if __name__ == "__main__":
     output_path = sys.argv[4]
     location = sys.argv[5]
 
+    week_start = (
+        sys.argv[6].strip()
+        if len(sys.argv) >= 7
+        else None
+    )
+
+    week_end = (
+        sys.argv[7].strip()
+        if len(sys.argv) >= 8
+        else None
+    )
+
     final_df = main(
         shifts_path,
         wages_path,
@@ -930,5 +1062,10 @@ if __name__ == "__main__":
         f"Processed CSV written to: {output_path}"
     )
 
-    # Upsert the same final dataframe into Supabase.
-    write_to_supabase(final_df)
+    # Replace the reporting week for this location in Supabase.
+    write_to_supabase(
+        final_df,
+        location,
+        week_start,
+        week_end,
+    )

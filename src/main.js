@@ -408,6 +408,24 @@ function formatRevelDate(date) {
 }
 
 
+function formatIsoDate(date) {
+    const month =
+        String(
+            date.getUTCMonth() + 1,
+        ).padStart(2, '0');
+
+    const day =
+        String(
+            date.getUTCDate(),
+        ).padStart(2, '0');
+
+    const year =
+        date.getUTCFullYear();
+
+    return `${year}-${month}-${day}`;
+}
+
+
 function getWeekRange(inputDate) {
     const selectedDate =
         parseInputDate(inputDate);
@@ -439,6 +457,17 @@ function getWeekRange(inputDate) {
 
         rangeTo:
             formatRevelDate(sunday),
+
+        /*
+         * Supabase stores dates as YYYY-MM-DD, so the
+         * purge boundaries need that form rather than
+         * the MM/DD/YYYY form Revel expects.
+         */
+        weekStart:
+            formatIsoDate(monday),
+
+        weekEnd:
+            formatIsoDate(sunday),
     };
 }
 
@@ -970,6 +999,8 @@ async function processCsvsWithPython(
     wagesCsvBuffer,
     payrollCsvBuffer,
     location,
+    weekStart,
+    weekEnd,
 ) {
     const shiftsTempPath =
         '/tmp/shifts.csv';
@@ -1049,6 +1080,8 @@ async function processCsvsWithPython(
                     payrollTempPath,
                     processedTempPath,
                     location,
+                    weekStart,
+                    weekEnd,
                 ],
                 {
                     timeout:
@@ -1243,6 +1276,8 @@ try {
     const {
         rangeFrom,
         rangeTo,
+        weekStart,
+        weekEnd,
     } = getWeekRange(
         revelDateFieldShift,
     );
@@ -2037,7 +2072,11 @@ try {
 
                 log.info(
                     'All three raw reports downloaded. '
-                    + 'Starting Python processing.',
+                    + 'Starting Python processing. '
+                    + 'Supabase rows for '
+                    + `${targetEstablishment} from `
+                    + `${weekStart} through ${weekEnd} `
+                    + 'will be replaced.',
                 );
 
                 const processedCsvBuffer =
@@ -2046,6 +2085,8 @@ try {
                         wagesCsvBuffer,
                         payrollCsvBuffer,
                         targetEstablishment,
+                        weekStart,
+                        weekEnd,
                     );
 
                 /*
