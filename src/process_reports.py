@@ -698,12 +698,156 @@ def reshape_shift_intervals(df_shifts):
 # ============================================================
 
 
+def consistent_value(values, label, employee, role):
+    """
+    Returns the only non-empty value in a payroll group.
+
+    Employee id, external id, and active flag should match across
+    wage rows for the same person and role.
+    """
+    unique_values = []
+
+    for value in values:
+        if pd.isna(value) or str(value).strip() == "":
+            continue
+
+        if value not in unique_values:
+            unique_values.append(value)
+
+    if len(unique_values) > 1:
+        rendered = ", ".join(str(value) for value in unique_values)
+        raise ValueError(
+            f"Payroll has conflicting {label} values for "
+            f"{employee} / {role}: {rendered}."
+        )
+
+    if not unique_values:
+        return pd.NA
+
+    return unique_values[0]
+
+
+def combine_role_wages(payroll):
+    """
+    Collapses payroll to one row per employee and role.
+
+    Revel repeats a role when the wage changed during the week.
+    The shift grid has clock ranges by role only, so those shifts
+    are priced at the hours-weighted average of the role's wages.
+    """
+    combined_rows = []
+
+    grouped = payroll.groupby(
+        ["employee", "role"],
+        sort=False,
+    )
+
+    for (employee, role), group in grouped:
+        row_hours = []
+        weighted_pay = Decimal("0")
+        total_hours = Decimal("0")
+
+        for row in group.itertuples(index=False):
+            hours = (
+                Decimal(str(row.payroll_regular_hours))
+                + Decimal(str(row.payroll_overtime_hours))
+                + Decimal(str(row.payroll_doubletime_hours))
+            )
+            row_hours.append((row.hourly_wage, hours))
+            total_hours += hours
+            weighted_pay += row.hourly_wage * hours
+
+        distinct_wages = []
+
+        for wage, _hours in row_hours:
+            if wage not in distinct_wages:
+                distinct_wages.append(wage)
+
+        if len(distinct_wages) == 1:
+            hourly_wage = distinct_wages[0]
+        elif total_hours <= 0:
+            rendered = ", ".join(
+                format(wage, "f") for wage in distinct_wages
+            )
+            raise ValueError(
+                f"Payroll lists multiple wages for {employee} / "
+                f"{role} ({rendered}) but none of those rows "
+                "have hours to weight them."
+            )
+        else:
+            hourly_wage = (
+                weighted_pay / total_hours
+            ).quantize(
+                Decimal("0.0001"),
+                rounding=ROUND_HALF_UP,
+            )
+            details = ", ".join(
+                f"{format(wage, 'f')} for {format(hours, 'f')} hours"
+                for wage, hours in row_hours
+            )
+            print(
+                f"{employee} / {role} has more than one payroll "
+                f"wage ({details}). The shift report does not "
+                "identify which clock range used which rate, so "
+                "those shifts are priced at the hours-weighted "
+                f"wage {format(hourly_wage, 'f')}."
+            )
+
+        combined_rows.append({
+            "employee": employee,
+            "role": role,
+            "employee_id": consistent_value(
+                group["employee_id"],
+                "employee ID",
+                employee,
+                role,
+            ),
+            "ext_id": consistent_value(
+                group["ext_id"],
+                "Ext. ID",
+                employee,
+                role,
+            ),
+            "is_active": consistent_value(
+                group["is_active"],
+                "active flag",
+                employee,
+                role,
+            ),
+            "hourly_wage": hourly_wage,
+            "payroll_regular_hours": sum(
+                (
+                    Decimal(str(value))
+                    for value in group["payroll_regular_hours"]
+                ),
+                Decimal("0"),
+            ),
+            "payroll_overtime_hours": sum(
+                (
+                    Decimal(str(value))
+                    for value in group["payroll_overtime_hours"]
+                ),
+                Decimal("0"),
+            ),
+            "payroll_doubletime_hours": sum(
+                (
+                    Decimal(str(value))
+                    for value in group["payroll_doubletime_hours"]
+                ),
+                Decimal("0"),
+            ),
+        })
+
+    return pd.DataFrame(combined_rows)
+
+
 def clean_payroll(df_payroll):
     """
     Keeps one wage row per employee and role.
 
     The blank-role row is the employee total. Expand Roles is what
-    produces the role rows this function uses.
+    produces the role rows this function uses. A repeated role with
+    a different wage is combined into an hours-weighted wage.
     """
     require_columns(
         df_payroll,
@@ -781,26 +925,7 @@ def clean_payroll(df_payroll):
         lambda value: round_money(value)
     )
 
-    duplicate_wages = (
-        payroll
-        .groupby(["employee", "role"])["hourly_wage"]
-        .nunique()
-    )
-    conflicting = duplicate_wages[duplicate_wages > 1]
-
-    if not conflicting.empty:
-        employee, role = conflicting.index[0]
-        raise ValueError(
-            "Payroll has more than one wage for "
-            f"{employee} / {role}."
-        )
-
-    payroll = (
-        payroll
-        .sort_values(["employee", "role"])
-        .drop_duplicates(["employee", "role"], keep="first")
-        .reset_index(drop=True)
-    )
+    payroll = combine_role_wages(payroll)
 
     doubletime = payroll[
         payroll["payroll_doubletime_hours"] > 0
