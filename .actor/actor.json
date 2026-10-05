@@ -2,7 +2,7 @@
     "actorSpecification": 1,
     "name": "revel-shift-worked-actor",
     "title": "Layne's Revel Report Exporter",
-    "description": "Logs into the Layne's Revel portal, runs configured reports for selected locations and business dates, and exports the results.",
+    "description": "Logs into the Layne's Revel portal, downloads Time Worked Shifts and Payroll, and writes calculated shift hours priced with the payroll wage.",
     "version": "0.1",
     "buildTag": "latest",
     "dockerfile": "../Dockerfile",

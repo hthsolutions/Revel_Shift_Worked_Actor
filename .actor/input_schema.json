@@ -1,7 +1,7 @@
 {
   "$schema": "https://apify.com/schemas/v1/input.ide.json",
   "title": "Layne's Revel Employee Time Worked",
-  "description": "Download weekly employee time worked data from Revel. The reporting week is automatically determined by get_summary_shift_date.py.",
+  "description": "Download Time Worked Shifts and Payroll from Revel, calculate hours from the shift clock ranges, and price them with the payroll wage. The reporting week is determined by get_summary_shift_date.py.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {

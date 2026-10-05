@@ -505,6 +505,11 @@ function formatEstablishmentForKey(value) {
 /*
  * ---------------------------------------------------------
  * BUILD TIME WORKED REPORT URL
+ *
+ * Shifts view, with only these checkboxes on:
+ *   Show All, Hide empty, Display Roles.
+ * Total Wages stays off. Hours are calculated from
+ * the clock ranges instead of the Total Hours column.
  * ---------------------------------------------------------
  */
 
@@ -521,7 +526,7 @@ function buildTimeWorkedReportUrl(
         all_departments: 'false',
         show_all: '1',
         remove_empty_items: '1',
-        include_total_wages: '1',
+        include_total_wages: '0',
         display_roles: 'on',
         type: 'shift',
     };
@@ -538,6 +543,10 @@ function buildTimeWorkedReportUrl(
 /*
  * ---------------------------------------------------------
  * BUILD PAYROLL REPORT URL
+ *
+ * Checkboxes: Show All, Hide empty, Expand Roles.
+ * expand_all is the Expand Roles checkbox. The role
+ * rows it adds are the source of the hourly wage.
  * ---------------------------------------------------------
  */
 
@@ -996,7 +1005,6 @@ async function downloadCsv(
 
 async function processCsvsWithPython(
     shiftsCsvBuffer,
-    wagesCsvBuffer,
     payrollCsvBuffer,
     location,
     weekStart,
@@ -1004,9 +1012,6 @@ async function processCsvsWithPython(
 ) {
     const shiftsTempPath =
         '/tmp/shifts.csv';
-
-    const wagesTempPath =
-        '/tmp/wages.csv';
 
     const payrollTempPath =
         '/tmp/payroll.csv';
@@ -1023,11 +1028,6 @@ async function processCsvsWithPython(
         writeFile(
             shiftsTempPath,
             shiftsCsvBuffer,
-        ),
-
-        writeFile(
-            wagesTempPath,
-            wagesCsvBuffer,
         ),
 
         writeFile(
@@ -1076,7 +1076,6 @@ async function processCsvsWithPython(
                 [
                     PROCESS_REPORTS_PATH,
                     shiftsTempPath,
-                    wagesTempPath,
                     payrollTempPath,
                     processedTempPath,
                     location,
@@ -1922,90 +1921,6 @@ try {
 
                 /*
                  * =========================================
-                 * EXPORT #2
-                 * WAGES
-                 * =========================================
-                 */
-
-                log.info(
-                    'Switching Time Worked report '
-                    + 'to Wage view.',
-                );
-
-                const wageRadio =
-                    page.locator(
-                        'input[type="radio"]'
-                        + '[name="rows_types"]'
-                        + '[value="wage"]',
-                    );
-
-                await wageRadio.waitFor({
-                    state:
-                        'attached',
-
-                    timeout:
-                        20_000,
-                });
-
-                if (
-                    !(await wageRadio.isChecked())
-                ) {
-                    await wageRadio.check({
-                        force:
-                            true,
-                    });
-                }
-
-                await page.waitForFunction(
-                    () => {
-                        const radio =
-                            document.querySelector(
-                                'input[type="radio"]'
-                                + '[name="rows_types"]'
-                                + '[value="wage"]',
-                            );
-
-                        return Boolean(
-                            radio
-                            && radio.checked,
-                        );
-                    },
-                    {
-                        timeout:
-                            20_000,
-
-                        polling:
-                            250,
-                    },
-                );
-
-                const wagesCsvUrl =
-                    await waitForTimeWorkedCsvHref(
-                        page,
-                        'wage',
-                        rangeFrom,
-                        rangeTo,
-                    );
-
-                log.info(
-                    'Wages CSV URL: '
-                    + `${wagesCsvUrl.href}`,
-                );
-
-                const wagesCsvBuffer =
-                    await downloadCsv(
-                        page,
-                        wagesCsvUrl,
-                        'Employee Time Worked Wages',
-                    );
-
-                log.info(
-                    'Wages CSV retained in memory.',
-                );
-
-                /*
-                 * =========================================
-                 * EXPORT #3
                  * PAYROLL
                  * =========================================
                  */
@@ -2066,14 +1981,14 @@ try {
 
                 /*
                  * =========================================
-                 * PROCESS ALL 3 RAW REPORTS
+                 * PROCESS SHIFTS AND PAYROLL
                  * =========================================
                  */
 
                 log.info(
-                    'All three raw reports downloaded. '
-                    + 'Starting Python processing. '
-                    + 'Supabase rows for '
+                    'Time Worked Shifts and Payroll '
+                    + 'downloaded. Starting Python '
+                    + 'processing. Supabase rows for '
                     + `${targetEstablishment} from `
                     + `${weekStart} through ${weekEnd} `
                     + 'will be replaced.',
@@ -2082,7 +1997,6 @@ try {
                 const processedCsvBuffer =
                     await processCsvsWithPython(
                         shiftsCsvBuffer,
-                        wagesCsvBuffer,
                         payrollCsvBuffer,
                         targetEstablishment,
                         weekStart,
@@ -2140,9 +2054,6 @@ try {
                         shiftsBytes:
                             shiftsCsvBuffer.length,
 
-                        wagesBytes:
-                            wagesCsvBuffer.length,
-
                         payrollBytes:
                             payrollCsvBuffer.length,
                     },
@@ -2163,11 +2074,12 @@ try {
                             .toISOString(),
 
                     message:
-                        'Downloaded Time Worked Shifts, '
-                        + 'Time Worked Wages, and Payroll '
-                        + 'reports, processed them with '
-                        + 'Python, and saved only the '
-                        + 'final processed CSV.',
+                        'Downloaded Time Worked Shifts '
+                        + 'and Payroll, calculated hours '
+                        + 'from the shift clock ranges, '
+                        + 'priced them with the payroll '
+                        + 'wage, and saved the processed '
+                        + 'CSV.',
                 });
 
                 /*

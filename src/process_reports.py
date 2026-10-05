@@ -1,15 +1,20 @@
-import pandas as pd
-import numpy as np
-from datetime import datetime, timezone
 import hashlib
 import os
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
+import pandas as pd
 from supabase import create_client
 
 
 SUPABASE_TABLE = "daily_employee_shift_timeworked_summary"
 SUPABASE_BATCH_SIZE = 500
 
+# Weekly overtime starts after 40 hours worked by one employee,
+# across every role. Overtime is paid at 1.5 times the payroll
+# wage of the role being worked when the hour occurs.
+WEEKLY_REGULAR_HOUR_LIMIT = Decimal("40")
+OVERTIME_MULTIPLIER = Decimal("1.5")
 
 WEEKDAYS = (
     "monday",
@@ -27,16 +32,34 @@ WEEKDAYS = (
 # ============================================================
 
 
+def round_hours(value):
+    """
+    Keeps minute-level clock math stable without turning it into
+    a binary float.
+    """
+    return Decimal(str(value)).quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def round_money(value):
+    return Decimal(str(value)).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
 def create_record_key(row):
     """
-    Creates a deterministic key for:
-        Location + Employee ID + Role + Shift Start
-
-    Shift_Start is used instead of the raw Start_Interval because
-    Start_Interval contains only the clock time in this dataset.
-    Shift_Start contains both the date and start time.
+    Deterministic key for location + payroll employee id + role + shift start.
     """
-    required_fields = ["Location", "ID", "Role", "Shift_Start"]
+    required_fields = [
+        "location",
+        "employee_id",
+        "role",
+        "shift_start",
+    ]
 
     missing_fields = [
         field
@@ -51,14 +74,14 @@ def create_record_key(row):
         )
 
     shift_start = pd.to_datetime(
-        row["Shift_Start"],
+        row["shift_start"],
         errors="raise",
     ).strftime("%Y-%m-%dT%H:%M:%S")
 
     value = "|".join([
-        str(row["Location"]).strip(),
-        str(row["ID"]).strip(),
-        str(row["Role"]).strip(),
+        str(row["location"]).strip(),
+        str(row["employee_id"]).strip(),
+        str(row["role"]).strip(),
         shift_start,
     ])
 
@@ -67,97 +90,112 @@ def create_record_key(row):
     ).hexdigest()
 
 
+def as_timestamp(value):
+    if pd.isna(value):
+        return None
+
+    parsed = pd.to_datetime(value, errors="coerce")
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.isoformat()
+
+
+def as_date(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.strftime("%Y-%m-%d")
+
+
+def as_decimal_number(value):
+    if value is None or pd.isna(value):
+        return None
+
+    return float(value)
+
+
 def prepare_supabase_records(df):
     """
-    Converts the final TimeWorked dataframe into records whose field names
-    and data types match the Supabase table.
+    Converts the shift dataframe into records for
+    daily_employee_shift_timeworked_summary.
+
+    Expected table:
+
+        record_key text primary key,
+        location text not null,
+        employee text not null,
+        employee_id text not null,
+        ext_id text,
+        role text not null,
+        is_active boolean,
+        weekday text not null,
+        date date not null,
+        interval text not null,
+        shift_start timestamp not null,
+        shift_end timestamp not null,
+        hours numeric not null,
+        cumulative_hours numeric not null,
+        regular_hours numeric not null,
+        ot_hours numeric not null,
+        hourly_wage numeric not null,
+        regular_wages numeric not null,
+        ot_wages numeric not null,
+        shift_wages numeric not null,
+        updated_at timestamptz not null default now()
     """
-    db_df = df.copy()
+    updated_at = datetime.now(timezone.utc).isoformat()
+    records = []
 
-    db_df = db_df.rename(
-        columns={
-            "Employee": "employee",
-            "Role": "role",
-            "Interval": "interval",
-            "Weekday": "weekday",
-            "Date": "date",
-            "Start_Interval": "start_interval",
-            "End_Interval": "end_interval",
-            "Duration": "duration",
-            "Total Week Hours": "total_week_hours",
-            "Total Week Wage": "total_week_wage",
-            "Shift_Start": "shift_start",
-            "Cumulative_Hours_Duration": "cumulative_hours_duration",
-            "Regular_Hours": "regular_hours",
-            "OT_Hours": "ot_hours",
-            "ID": "id",
-            "Wages Earned": "wages_earned",
-            "Weighted_Hours": "weighted_hours",
-            "Daily_Role_Wages": "daily_role_wages",
-            "Daily_Role_Weighted_Hours": "daily_role_weighted_hours",
-            "Role_Hourly_Rate": "role_hourly_rate",
-            "Shift_Regular_Wages": "shift_regular_wages",
-            "Shift_OT_Wages": "shift_ot_wages",
-            "Shift_Wages": "shift_wages",
-            "Location": "location",
-            "Shift_End": "shift_end",
-        }
-    )
+    for _, row in df.iterrows():
+        is_active = row["is_active"]
 
-    # The Supabase table currently defines start_interval/end_interval as
-    # TIMESTAMP columns. The CSV Start_Interval/End_Interval fields contain
-    # only clock times, so store their corresponding complete timestamps.
-    db_df["start_interval"] = pd.to_datetime(
-        db_df["shift_start"],
-        errors="coerce",
-    )
+        if pd.isna(is_active):
+            is_active = None
+        else:
+            is_active = bool(is_active)
 
-    db_df["end_interval"] = pd.to_datetime(
-        db_df["shift_end"],
-        errors="coerce",
-    )
+        ext_id = row["ext_id"]
 
-    # PostgreSQL DATE field.
-    db_df["date"] = pd.to_datetime(
-        db_df["date"],
-        errors="coerce",
-    ).dt.strftime("%Y-%m-%d")
+        if pd.isna(ext_id) or str(ext_id).strip() == "":
+            ext_id = None
+        else:
+            ext_id = str(ext_id).strip()
 
-    # PostgreSQL TIMESTAMP fields.
-    timestamp_columns = [
-        "start_interval",
-        "end_interval",
-        "shift_start",
-        "shift_end",
-    ]
+        records.append({
+            "record_key": row["record_key"],
+            "location": str(row["location"]).strip(),
+            "employee": str(row["employee"]).strip(),
+            "employee_id": str(row["employee_id"]).strip(),
+            "ext_id": ext_id,
+            "role": str(row["role"]).strip(),
+            "is_active": is_active,
+            "weekday": str(row["weekday"]).strip(),
+            "date": as_date(row["date"]),
+            "interval": str(row["interval"]).strip(),
+            "shift_start": as_timestamp(row["shift_start"]),
+            "shift_end": as_timestamp(row["shift_end"]),
+            "hours": as_decimal_number(row["hours"]),
+            "cumulative_hours": as_decimal_number(
+                row["cumulative_hours"]
+            ),
+            "regular_hours": as_decimal_number(
+                row["regular_hours"]
+            ),
+            "ot_hours": as_decimal_number(row["ot_hours"]),
+            "hourly_wage": as_decimal_number(row["hourly_wage"]),
+            "regular_wages": as_decimal_number(
+                row["regular_wages"]
+            ),
+            "ot_wages": as_decimal_number(row["ot_wages"]),
+            "shift_wages": as_decimal_number(row["shift_wages"]),
+            "updated_at": updated_at,
+        })
 
-    for column in timestamp_columns:
-        db_df[column] = pd.to_datetime(
-            db_df[column],
-            errors="coerce",
-        ).apply(
-            lambda value: (
-                value.isoformat()
-                if pd.notna(value)
-                else None
-            )
-        )
-
-    # updated_at has a DEFAULT on insert, but PostgreSQL does not
-    # automatically change it on UPDATE. Set it explicitly for upserts.
-    db_df["updated_at"] = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    # Replace pandas missing values with JSON-compatible None.
-    db_df = db_df.astype(object).where(
-        pd.notnull(db_df),
-        None,
-    )
-
-    return db_df.to_dict(
-        orient="records"
-    )
+    return records
 
 
 def parse_week_boundary(value, label):
@@ -262,12 +300,9 @@ def write_to_supabase(
         )
         return 0
 
-    # The purge filters on location, so it has to match the value being
-    # written byte for byte. A mismatch would quietly delete nothing and
-    # leave stale rows behind.
     written_locations = sorted({
         str(value)
-        for value in df["Location"].dropna().unique()
+        for value in df["location"].dropna().unique()
     })
 
     if written_locations != [location_name]:
@@ -350,53 +385,89 @@ def write_to_supabase(
     return total_uploaded
 
 
-def remove_non_employee_rows(df):
+def normalize_columns(df):
     """
-    Keeps rows where Employee appears to be in 'Last, First' format.
+    Collapses the line breaks Revel puts inside payroll headers.
     """
-    df = df.copy()
+    renamed = df.copy()
 
-    df["Employee"] = (
-        df["Employee"]
-        .astype("string")
-        .str.strip()
-    )
+    renamed.columns = [
+        " ".join(str(column).replace("\n", " ").split())
+        for column in renamed.columns
+    ]
 
-    df = df[
-        df["Employee"].str.contains(",", na=False)
-    ].reset_index(drop=True)
+    return renamed
 
-    return df
+
+def require_columns(df, columns, report_name):
+    missing = [
+        column
+        for column in columns
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"{report_name} is missing required column(s): "
+            + ", ".join(missing)
+            + ". Found: "
+            + ", ".join(str(column) for column in df.columns)
+        )
+
+
+def parse_bool(value):
+    if pd.isna(value):
+        return pd.NA
+
+    text = str(value).strip().lower()
+
+    if text in {"true", "1", "yes"}:
+        return True
+
+    if text in {"false", "0", "no"}:
+        return False
+
+    return pd.NA
+
+
+def format_identifier(value):
+    if pd.isna(value):
+        return pd.NA
+
+    text = str(value).strip()
+
+    if not text or text.lower() == "nan":
+        return pd.NA
+
+    if text.endswith(".0"):
+        text = text[:-2]
+
+    return text
 
 
 def identify_columns(df):
     """
-    Returns columns that begin or end with a weekday name.
+    Returns columns that begin with a weekday name.
     """
     return [
         col
         for col in df.columns
         if str(col).lower().startswith(WEEKDAYS)
-        or str(col).lower().endswith(WEEKDAYS)
     ]
 
 
 def parse_day_column(column_name):
     """
     Extracts weekday and date from a column name such as:
-        Monday 9/7/2026
-
-    Returns:
-        weekday, date_string
+        Monday 07/27/2026
     """
-    col = str(column_name).strip()
-    parts = col.split()
+    parts = str(column_name).strip().split()
 
     if not parts:
         return None, None
 
     weekday = (
-        parts[0].lower()
+        parts[0]
         if parts[0].lower() in WEEKDAYS
         else None
     )
@@ -409,10 +480,7 @@ def parse_day_column(column_name):
 def parse_interval(interval):
     """
     Parses a shift interval such as:
-        8:00AM-2:00PM
-
-    Returns:
-        start_time, end_time
+        10:27AM - 4:08PM
     """
     if pd.isna(interval):
         return None, None
@@ -423,7 +491,6 @@ def parse_interval(interval):
         return None, None
 
     start_time, end_time = interval.split("-", 1)
-
     start_time = start_time.strip()
     end_time = end_time.strip()
 
@@ -433,142 +500,117 @@ def parse_interval(interval):
     return start_time, end_time
 
 
+def clock_on_date(shift_start, end_time):
+    """
+    Places the clock-out on the shift date, rolling to the next
+    date when the clock-out is after midnight.
+    """
+    end_clock = datetime.strptime(end_time.strip(), "%I:%M%p")
+    shift_end = shift_start.replace(
+        hour=end_clock.hour,
+        minute=end_clock.minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if shift_end < shift_start:
+        shift_end = shift_end + pd.Timedelta(days=1)
+
+    return shift_end
+
+
 def get_shift_interval_duration(start_time, end_time):
     """
-    Calculates shift duration in hours.
+    Hours between two clock times.
 
-    Handles overnight shifts, for example:
-        10:00PM -> 2:00AM = 4 hours
+    A clock-out earlier than the clock-in is treated as the next day,
+    for example 10:00PM -> 2:00AM = 4 hours.
     """
-    if not start_time or not end_time:
-        return np.nan
+    start = datetime.strptime(start_time.strip(), "%I:%M%p")
+    end = datetime.strptime(end_time.strip(), "%I:%M%p")
+    seconds = (end - start).total_seconds()
 
-    try:
-        start = datetime.strptime(start_time.strip(), "%I:%M%p")
-        end = datetime.strptime(end_time.strip(), "%I:%M%p")
+    if seconds < 0:
+        seconds += 24 * 60 * 60
 
-        seconds = (end - start).total_seconds()
-
-        if seconds < 0:
-            seconds += 24 * 60 * 60
-
-        return seconds / 3600
-
-    except (ValueError, AttributeError, TypeError):
-        return np.nan
+    return round_hours(seconds / 3600)
 
 
 # ============================================================
 # DATA LOADING
 # ============================================================
 
-def load_data(shifts_path,wages_path,payroll_path):
-    df_shifts = pd.read_csv(shifts_path)
-    df_wages = pd.read_csv(wages_path)
-    df_payroll = pd.read_csv(payroll_path)
 
-    return df_shifts, df_wages, df_payroll
+def load_data(shifts_path, payroll_path):
+    df_shifts = normalize_columns(
+        pd.read_csv(shifts_path, dtype=str)
+    )
+    df_payroll = normalize_columns(
+        pd.read_csv(payroll_path, dtype=str)
+    )
+
+    return df_shifts, df_payroll
 
 
 # ============================================================
 # SHIFTS
 # ============================================================
 
-def clean_shifts(df_shifts):
-    df = df_shifts.copy()
-
-    df["Employee"] = df["Employee"].astype("string").str.strip()
-    df["Role Name"] = df["Role Name"].astype("string").str.strip()
-
-    df["Total Hours"] = pd.to_numeric(
-        df["Total Hours"],
-        errors="coerce"
-    )
-
-    df["Total Wage"] = pd.to_numeric(
-        df["Total Wage"],
-        errors="coerce"
-    )
-
-    # Calculate implied base hourly rate.
-    #
-    # If Total Hours > 40:
-    #
-    # Total Wage =
-    #   40 * rate
-    #   + overtime_hours * rate * 1.5
-    #
-    regular_hours = df["Total Hours"].clip(upper=40)
-    overtime_hours = (df["Total Hours"] - 40).clip(lower=0)
-
-    weighted_hours = (
-        regular_hours
-        + overtime_hours * 1.5
-    )
-
-    df["Hourly Rate"] = np.where(
-        weighted_hours > 0,
-        df["Total Wage"] / weighted_hours,
-        np.nan
-    )
-
-    # Round hourly rate to nearest $0.25
-    df["Hourly Rate"] = (
-        df["Hourly Rate"] * 4
-    ).round() / 4
-
-    df["Regular Hours"] = regular_hours
-    df["Overtime Hours"] = overtime_hours
-
-    df["Regular Wage"] = (
-        df["Hourly Rate"]
-        * df["Regular Hours"]
-    ).round(2)
-
-    df["Overtime Wage"] = (
-        df["Hourly Rate"]
-        * df["Overtime Hours"]
-        * 1.5
-    ).round(2)
-
-    return df
-
 
 def reshape_shift_intervals(df_shifts):
     """
-    Converts weekday/date shift columns into one row per shift interval.
+    Converts each clock range in the Time Worked Shifts grid into one row.
+
+    Hours come from those clock ranges. The report's Total Hours column
+    is ignored because it does not match the ranges on the grid.
     """
-    interval_list = []
+    require_columns(
+        df_shifts,
+        ["Employee", "Role Name"],
+        "Time Worked Shifts",
+    )
 
     day_columns = identify_columns(df_shifts)
 
-    for _, row in df_shifts.iterrows():
+    if not day_columns:
+        raise ValueError(
+            "Time Worked Shifts has no weekday columns. "
+            "Found: "
+            + ", ".join(str(column) for column in df_shifts.columns)
+        )
 
+    interval_list = []
+
+    for _, row in df_shifts.iterrows():
         employee = (
             str(row["Employee"]).strip()
             if pd.notna(row["Employee"])
-            else None
+            else ""
         )
+
+        if "," not in employee:
+            continue
 
         role = (
             str(row["Role Name"]).strip()
             if pd.notna(row["Role Name"])
-            else None
+            else ""
         )
 
-        for col in day_columns:
+        if not role or role.lower() == "nan":
+            raise ValueError(
+                "Time Worked Shifts is missing a role for "
+                f"{employee}. Display Roles needs to be checked."
+            )
 
-            weekday, date_value = parse_day_column(col)
-
-            cell_value = row[col]
+        for column in day_columns:
+            weekday, date_value = parse_day_column(column)
+            cell_value = row[column]
 
             if pd.isna(cell_value):
                 continue
 
-            intervals = str(cell_value).split(";")
-
-            for interval in intervals:
-
+            for interval in str(cell_value).split(";"):
                 interval = interval.strip()
 
                 if not interval:
@@ -577,449 +619,463 @@ def reshape_shift_intervals(df_shifts):
                 start_time, end_time = parse_interval(interval)
 
                 if not start_time or not end_time:
-                    continue
+                    raise ValueError(
+                        "Could not read shift "
+                        f"'{interval}' for {employee} "
+                        f"on {column}."
+                    )
 
-                duration = get_shift_interval_duration(
-                    start_time,
-                    end_time
-                )
+                interval_list.append({
+                    "employee": employee,
+                    "role": role,
+                    "interval": interval,
+                    "weekday": weekday,
+                    "date": date_value,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "hours": get_shift_interval_duration(
+                        start_time,
+                        end_time,
+                    ),
+                })
 
-                interval_list.append(
-                    {
-                        "Employee": employee,
-                        "Role": role,
-                        "Interval": interval,
-                        "Weekday": weekday,
-                        "Date": date_value,
-                        "Start_Interval": start_time,
-                        "End_Interval": end_time,
-                        "Duration": duration,
-                        "Total Week Hours": (
-                            row["Total Hours"]
-                            if pd.notna(row["Total Hours"])
-                            else np.nan
-                        ),
-                        "Total Week Wage": (
-                            row["Total Wage"]
-                            if pd.notna(row["Total Wage"])
-                            else np.nan
-                        ),
-                    }
-                )
+    shifts = pd.DataFrame(interval_list)
 
-    new_df = pd.DataFrame(interval_list)
+    if shifts.empty:
+        raise ValueError(
+            "Time Worked Shifts did not contain any clock ranges."
+        )
 
-    if new_df.empty:
-        return new_df
-
-    new_df["Date"] = pd.to_datetime(
-        new_df["Date"],
-        errors="coerce"
+    shifts["date"] = pd.to_datetime(
+        shifts["date"],
+        errors="coerce",
     )
 
-    # Build a real shift start datetime so chronological sorting
-    # works correctly.
-    new_df["Shift_Start"] = pd.to_datetime(
+    shifts["shift_start"] = pd.to_datetime(
         (
-            new_df["Date"].dt.strftime("%Y-%m-%d")
+            shifts["date"].dt.strftime("%Y-%m-%d")
             + " "
-            + new_df["Start_Interval"]
+            + shifts["start_time"]
         ),
         format="%Y-%m-%d %I:%M%p",
-        errors="coerce"
+        errors="coerce",
     )
 
-    new_df = (
-        new_df
-        .dropna(
-            subset=[
-                "Employee",
-                "Date",
-                "Shift_Start",
-                "Duration",
-            ]
+    invalid = shifts[
+        shifts["date"].isna()
+        | shifts["shift_start"].isna()
+        | shifts["weekday"].isna()
+    ]
+
+    if not invalid.empty:
+        sample = invalid.iloc[0]
+        raise ValueError(
+            "Could not build a shift timestamp for "
+            f"{sample['employee']} interval '{sample['interval']}'."
         )
+
+    shifts["shift_end"] = [
+        clock_on_date(start, end_time)
+        for start, end_time in zip(
+            shifts["shift_start"],
+            shifts["end_time"],
+        )
+    ]
+
+    shifts = (
+        shifts
         .sort_values(
-            by=[
-                "Employee",
-                "Shift_Start",
-            ]
+            by=["employee", "shift_start", "role", "interval"]
         )
         .reset_index(drop=True)
     )
 
-    return new_df
-
-
-# ============================================================
-# OVERTIME ALLOCATION
-# ============================================================
-
-def calculate_interval_overtime(df):
-    """
-    Allocates regular and overtime hours chronologically.
-
-    Example:
-        Employee starts shift at 38 cumulative weekly hours.
-        Shift duration = 6 hours.
-
-        Regular = 2
-        OT      = 4
-    """
-    df = df.copy()
-
-    df["Cumulative_Hours_Duration"] = (
-        df.groupby("Employee")["Duration"]
-        .cumsum()
-    )
-
-    previous_cumulative = (
-        df["Cumulative_Hours_Duration"]
-        - df["Duration"]
-    )
-
-    df["Regular_Hours"] = np.where(
-        previous_cumulative >= 40,
-        0,
-        np.minimum(
-            df["Duration"],
-            (40 - previous_cumulative).clip(lower=0)
-        )
-    )
-
-    df["OT_Hours"] = (
-        df["Duration"]
-        - df["Regular_Hours"]
-    )
-
-    return df
+    return shifts
 
 
 # ============================================================
 # PAYROLL
 # ============================================================
 
-def clean_payroll(df_payroll):
-    df = df_payroll.copy()
 
-    df = df[
-        df["Role"].notna()
-        & df["Employee"].notna()
+def clean_payroll(df_payroll):
+    """
+    Keeps one wage row per employee and role.
+
+    The blank-role row is the employee total. Expand Roles is what
+    produces the role rows this function uses.
+    """
+    require_columns(
+        df_payroll,
+        ["Employee", "Role", "ID", "Wage"],
+        "Payroll",
+    )
+
+    payroll = df_payroll[
+        df_payroll["Employee"].notna()
+        & df_payroll["Role"].notna()
     ].copy()
 
-    df["Employee"] = (
-        df["Employee"]
-        .astype("string")
-        .str.strip()
+    payroll["employee"] = (
+        payroll["Employee"].astype("string").str.strip()
+    )
+    payroll["role"] = (
+        payroll["Role"].astype("string").str.strip()
     )
 
-    df["Role"] = (
-        df["Role"]
-        .astype("string")
-        .str.strip()
+    payroll = payroll[
+        payroll["employee"].ne("")
+        & payroll["role"].ne("")
+        & payroll["role"].str.lower().ne("nan")
+        & payroll["employee"].str.lower().ne("nan")
+    ].copy()
+
+    if payroll.empty:
+        raise ValueError(
+            "Payroll did not contain any role rows. "
+            "Expand Roles needs to be checked."
+        )
+
+    payroll["employee_id"] = payroll["ID"].map(format_identifier)
+    payroll["ext_id"] = (
+        payroll["Ext. ID"].map(format_identifier)
+        if "Ext. ID" in payroll.columns
+        else pd.NA
+    )
+    payroll["is_active"] = (
+        payroll["Is Active"].map(parse_bool)
+        if "Is Active" in payroll.columns
+        else pd.NA
+    )
+    payroll["hourly_wage"] = pd.to_numeric(
+        payroll["Wage"],
+        errors="coerce",
     )
 
-    df["ID"] = pd.to_numeric(
-        df["ID"],
-        errors="coerce"
-    ).astype("Int64")
+    for source_name, target_name in (
+        ("Regular h.", "payroll_regular_hours"),
+        ("Overtime h.", "payroll_overtime_hours"),
+        ("Doubletime h.", "payroll_doubletime_hours"),
+    ):
+        if source_name in payroll.columns:
+            payroll[target_name] = pd.to_numeric(
+                payroll[source_name],
+                errors="coerce",
+            ).fillna(0)
+        else:
+            payroll[target_name] = 0
 
-    df = df[
-        ["Employee", "Role", "ID"]
-    ].drop_duplicates()
+    missing_identity = payroll[
+        payroll["employee_id"].isna()
+        | payroll["hourly_wage"].isna()
+    ]
 
-    return df
+    if not missing_identity.empty:
+        sample = missing_identity.iloc[0]
+        raise ValueError(
+            "Payroll role row is missing an ID or wage for "
+            f"{sample['employee']} / {sample['role']}."
+        )
+
+    payroll["hourly_wage"] = payroll["hourly_wage"].map(
+        lambda value: round_money(value)
+    )
+
+    duplicate_wages = (
+        payroll
+        .groupby(["employee", "role"])["hourly_wage"]
+        .nunique()
+    )
+    conflicting = duplicate_wages[duplicate_wages > 1]
+
+    if not conflicting.empty:
+        employee, role = conflicting.index[0]
+        raise ValueError(
+            "Payroll has more than one wage for "
+            f"{employee} / {role}."
+        )
+
+    payroll = (
+        payroll
+        .sort_values(["employee", "role"])
+        .drop_duplicates(["employee", "role"], keep="first")
+        .reset_index(drop=True)
+    )
+
+    doubletime = payroll[
+        payroll["payroll_doubletime_hours"] > 0
+    ]
+
+    if not doubletime.empty:
+        names = ", ".join(
+            sorted(doubletime["employee"].unique())
+        )
+        print(
+            "Payroll includes doubletime hours for "
+            f"{names}. Shift wages still use weekly overtime "
+            "at 1.5x after 40 hours, because the shift grid "
+            "does not identify which hours are doubletime."
+        )
+
+    return payroll[
+        [
+            "employee",
+            "role",
+            "employee_id",
+            "ext_id",
+            "is_active",
+            "hourly_wage",
+            "payroll_regular_hours",
+            "payroll_overtime_hours",
+            "payroll_doubletime_hours",
+        ]
+    ]
 
 
-def merge_payroll_ids(df_intervals, df_payroll):
-    df = df_intervals.merge(
-        df_payroll,
-        on=[
-            "Employee",
-            "Role",
-        ],
+def attach_payroll_wages(shifts, payroll):
+    merged = shifts.merge(
+        payroll,
+        on=["employee", "role"],
         how="left",
-        validate="many_to_one"
+        validate="many_to_one",
     )
 
-    # Remove GM rows, matching original behavior
-    df = df[
-        df["Role"] != "GM"
-    ].reset_index(drop=True)
+    unmatched = merged[merged["hourly_wage"].isna()]
 
-    return df
+    if not unmatched.empty:
+        pairs = sorted({
+            f"{row.employee} / {row.role}"
+            for row in unmatched.itertuples(index=False)
+        })
+        raise ValueError(
+            "No payroll wage for: " + ", ".join(pairs)
+        )
+
+    return merged
+
+
+def warn_when_hours_differ_from_payroll(df):
+    """
+    Payroll hours are not copied onto the shift rows. This only reports
+    employees whose clock-range total is more than 3 minutes away from
+    the payroll role total.
+    """
+    comparison = df.copy()
+    comparison["payroll_hours"] = (
+        comparison["payroll_regular_hours"]
+        + comparison["payroll_overtime_hours"]
+        + comparison["payroll_doubletime_hours"]
+    )
+
+    calculated = (
+        comparison
+        .groupby(["employee", "role"], sort=False)
+        .agg(
+            calculated_hours=("hours", "sum"),
+            payroll_hours=("payroll_hours", "max"),
+        )
+        .reset_index()
+    )
+
+    calculated["gap"] = (
+        calculated["calculated_hours"].map(
+            lambda value: Decimal(str(float(value)))
+        )
+        - calculated["payroll_hours"].map(
+            lambda value: Decimal(str(value))
+        )
+    ).abs()
+
+    mismatches = calculated[
+        calculated["gap"] > Decimal("0.05")
+    ]
+
+    if mismatches.empty:
+        print(
+            "Calculated shift hours are within 0.05 of "
+            "payroll role hours for every employee."
+        )
+        return
+
+    print(
+        "Calculated shift hours differ from payroll "
+        "role hours by more than 0.05:"
+    )
+
+    for row in mismatches.itertuples(index=False):
+        print(
+            f"  {row.employee} / {row.role}: "
+            f"shifts {float(row.calculated_hours):.2f}, "
+            f"payroll {float(row.payroll_hours):.2f}"
+        )
 
 
 # ============================================================
-# DAILY WAGES
+# HOURS AND WAGES
 # ============================================================
 
-def clean_wages(df_wages):
-    df = remove_non_employee_rows(df_wages)
 
-    df["Role Name"] = (
-        df["Role Name"]
-        .astype("string")
-        .str.strip()
-    )
-
-    return df
-
-
-def reshape_daily_wages(df_wages):
+def allocate_weekly_overtime(df):
     """
-    Converts daily wage columns into one row per:
-        Employee
-        Role
-        Date
+    Splits each shift into regular and overtime hours.
+
+    Hours are accumulated in clock order for the employee, across roles.
+    Time through 40 hours is regular. Time after that is overtime.
     """
-    wage_list = []
-
-    day_columns = identify_columns(df_wages)
-
-    for _, row in df_wages.iterrows():
-
-        employee = (
-            str(row["Employee"]).strip()
-            if pd.notna(row["Employee"])
-            else None
-        )
-
-        role = (
-            str(row["Role Name"]).strip()
-            if pd.notna(row["Role Name"])
-            else None
-        )
-
-        for col in day_columns:
-
-            weekday, date_value = parse_day_column(col)
-
-            wage_list.append(
-                {
-                    "Employee": employee,
-                    "Role": role,
-                    "Wages Earned": row[col],
-                    "Weekday": weekday,
-                    "Date": date_value,
-                }
-            )
-
-    df = pd.DataFrame(wage_list)
-
-    df["Wages Earned"] = pd.to_numeric(
-        df["Wages Earned"],
-        errors="coerce"
-    )
-
-    df["Date"] = pd.to_datetime(
-        df["Date"],
-        errors="coerce"
-    )
-
-    df = (
+    shifts = (
         df
-        .dropna(
-            subset=[
-                "Employee",
-                "Role",
-                "Date",
-                "Wages Earned",
-            ]
+        .sort_values(
+            by=["employee_id", "shift_start", "role", "interval"]
         )
         .reset_index(drop=True)
     )
 
-    return df
+    regular_hours = []
+    overtime_hours = []
+    cumulative_hours = []
+    hours_before_shift = {}
 
+    for row in shifts.itertuples(index=False):
+        already_worked = hours_before_shift.get(
+            row.employee_id,
+            Decimal("0"),
+        )
+        duration = row.hours
+        remaining_regular = (
+            WEEKLY_REGULAR_HOUR_LIMIT - already_worked
+        )
 
-# ============================================================
-# MERGE SHIFT + WAGE DATA
-# ============================================================
+        if remaining_regular <= 0:
+            regular = Decimal("0")
+        else:
+            regular = min(duration, remaining_regular)
 
-def merge_shift_wages(df_intervals, df_wages):
-    """
-    Matches each shift interval to the daily wages for the
-    Employee / Role / Date.
-    """
-    final_df = df_intervals.merge(
-        df_wages,
-        on=[
-            "Employee",
-            "Role",
-            "Weekday",
-            "Date",
-        ],
-        how="inner"
-    )
+        overtime = duration - regular
+        worked_through = already_worked + duration
 
-    return final_df
+        regular_hours.append(regular)
+        overtime_hours.append(overtime)
+        cumulative_hours.append(worked_through)
+        hours_before_shift[row.employee_id] = worked_through
 
+    shifts["regular_hours"] = regular_hours
+    shifts["ot_hours"] = overtime_hours
+    shifts["cumulative_hours"] = cumulative_hours
 
-# ============================================================
-# SHIFT WAGE ALLOCATION
-# ============================================================
+    return shifts
+
 
 def calculate_shift_wages(df):
     """
-    Calculates regular and overtime wages for each shift interval
-    by Employee ID + Role + Date.
+    Prices each shift from the payroll hourly wage.
+
+    Regular hours use the role wage. Overtime hours use 1.5 times
+    that same wage.
     """
+    priced = df.copy()
 
-    df = df.copy()
+    priced["regular_wages"] = [
+        round_money(hours * wage)
+        for hours, wage in zip(
+            priced["regular_hours"],
+            priced["hourly_wage"],
+        )
+    ]
+    priced["ot_wages"] = [
+        round_money(hours * wage * OVERTIME_MULTIPLIER)
+        for hours, wage in zip(
+            priced["ot_hours"],
+            priced["hourly_wage"],
+        )
+    ]
+    priced["shift_wages"] = [
+        regular + overtime
+        for regular, overtime in zip(
+            priced["regular_wages"],
+            priced["ot_wages"],
+        )
+    ]
 
-    # Weighted hours used to back into the base hourly rate.
-    df["Weighted_Hours"] = (
-        df["Regular_Hours"]
-        + df["OT_Hours"] * 1.5
-    )
+    return priced
 
-    # Total wages earned for this employee + role + date.
-    df["Daily_Role_Wages"] = (
-        df.groupby(
-            ["ID", "Role", "Date"]
-        )["Wages Earned"]
-        .transform("max")
-    )
-
-    # Total weighted hours for this employee + role + date.
-    df["Daily_Role_Weighted_Hours"] = (
-        df.groupby(
-            ["ID", "Role", "Date"]
-        )["Weighted_Hours"]
-        .transform("sum")
-    )
-
-    # Base hourly rate for the role/day.
-    df["Role_Hourly_Rate"] = np.where(
-        df["Daily_Role_Weighted_Hours"] > 0,
-        (
-            df["Daily_Role_Wages"]
-            / df["Daily_Role_Weighted_Hours"]
-        ),
-        np.nan
-    )
-
-    # Regular portion of this shift.
-    df["Shift_Regular_Wages"] = (
-        df["Role_Hourly_Rate"]
-        * df["Regular_Hours"]
-    ).round(2)
-
-    # OT portion of this shift.
-    df["Shift_OT_Wages"] = (
-        df["Role_Hourly_Rate"]
-        * 1.5
-        * df["OT_Hours"]
-    ).round(2)
-
-    # Optional total shift wages.
-    df["Shift_Wages"] = (
-        df["Shift_Regular_Wages"]
-        + df["Shift_OT_Wages"]
-    ).round(2)
-
-    return df
 
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
 
-def main(shifts_path,wages_path,payroll_path,location,):
 
-    df_shifts, df_wages, df_payroll = load_data(
+def main(shifts_path, payroll_path, location):
+    df_shifts, df_payroll = load_data(
         shifts_path,
-        wages_path,
         payroll_path,
     )
 
-    # --------------------------------------------------------
-    # Clean source files
-    # --------------------------------------------------------
+    shifts = reshape_shift_intervals(df_shifts)
+    payroll = clean_payroll(df_payroll)
+    shifts = attach_payroll_wages(shifts, payroll)
+    warn_when_hours_differ_from_payroll(shifts)
+    shifts = allocate_weekly_overtime(shifts)
+    shifts = calculate_shift_wages(shifts)
 
-    df_shifts = clean_shifts(df_shifts)
-    df_wages = clean_wages(df_wages)
-    df_payroll = clean_payroll(df_payroll)
+    location_name = str(location or "").strip()
 
-    # --------------------------------------------------------
-    # Convert weekly shifts into individual intervals
-    # --------------------------------------------------------
+    if not location_name:
+        raise ValueError("A location is required.")
 
-    shift_intervals = reshape_shift_intervals(
-        df_shifts
+    shifts["location"] = location_name
+    shifts["record_key"] = shifts.apply(
+        create_record_key,
+        axis=1,
     )
 
-    # --------------------------------------------------------
-    # Determine regular vs overtime hours
-    # --------------------------------------------------------
+    duplicate_keys = shifts["record_key"].duplicated()
 
-    shift_intervals = calculate_interval_overtime(
-        shift_intervals
-    )
-
-    # --------------------------------------------------------
-    # Add payroll employee ID
-    # --------------------------------------------------------
-
-    shift_intervals = merge_payroll_ids(
-        shift_intervals,
-        df_payroll
-    )
-
-    # --------------------------------------------------------
-    # Convert wages into daily employee / role records
-    # --------------------------------------------------------
-
-    daily_wages = reshape_daily_wages(
-        df_wages
-    )
-
-    # --------------------------------------------------------
-    # Join shift intervals to wages
-    # --------------------------------------------------------
-
-    final_df = merge_shift_wages(
-        shift_intervals,
-        daily_wages
-    )
-
-    # --------------------------------------------------------
-    # Allocate daily wages to individual shift intervals
-    # --------------------------------------------------------
-
-    final_df = calculate_shift_wages(
-        final_df
-    )
-
-    # Optional formatting
-    final_df["ID"] = (
-    final_df["ID"]
-    .astype("Int64")
-    .astype("string")
-    )
-
-    final_df["Location"] = location
-
-    final_df["Shift_End"] = (
-        pd.to_datetime(
-            final_df["Shift_Start"]
+    if duplicate_keys.any():
+        sample = shifts.loc[duplicate_keys].iloc[0]
+        raise ValueError(
+            "Two shifts produced the same record_key for "
+            f"{sample['employee']} / {sample['role']} "
+            f"starting {sample['shift_start']}."
         )
-        + pd.to_timedelta(
-            final_df["Duration"],
-            unit="h"
-        )
-    )
 
-    final_df["record_key"] = final_df.apply(create_record_key, axis=1)
-
-    final_df = final_df.sort_values(
-        [
-            "Employee",
-            "Shift_Start",
-        ]
+    shifts = shifts.sort_values(
+        ["employee", "shift_start", "role"]
     ).reset_index(drop=True)
 
-    return final_df
+    print(
+        f"Processed {len(shifts)} shifts "
+        f"for {shifts['employee_id'].nunique()} employees "
+        f"at {location_name}. "
+        f"Calculated hours "
+        f"{float(sum(shifts['hours'], Decimal('0'))):.2f}. "
+        f"Calculated wages "
+        f"{float(sum(shifts['shift_wages'], Decimal('0'))):.2f}."
+    )
+
+    return shifts[
+        [
+            "record_key",
+            "location",
+            "employee",
+            "employee_id",
+            "ext_id",
+            "role",
+            "is_active",
+            "weekday",
+            "date",
+            "interval",
+            "shift_start",
+            "shift_end",
+            "hours",
+            "cumulative_hours",
+            "regular_hours",
+            "ot_hours",
+            "hourly_wage",
+            "regular_wages",
+            "ot_wages",
+            "shift_wages",
+        ]
+    ]
 
 
 # ============================================================
@@ -1030,31 +1086,45 @@ if __name__ == "__main__":
     import sys
 
     shifts_path = sys.argv[1]
-    wages_path = sys.argv[2]
-    payroll_path = sys.argv[3]
-    output_path = sys.argv[4]
-    location = sys.argv[5]
+    payroll_path = sys.argv[2]
+    output_path = sys.argv[3]
+    location = sys.argv[4]
 
     week_start = (
+        sys.argv[5].strip()
+        if len(sys.argv) >= 6
+        else None
+    )
+
+    week_end = (
         sys.argv[6].strip()
         if len(sys.argv) >= 7
         else None
     )
 
-    week_end = (
-        sys.argv[7].strip()
-        if len(sys.argv) >= 8
-        else None
-    )
-
     final_df = main(
         shifts_path,
-        wages_path,
         payroll_path,
         location,
     )
 
-    final_df.to_csv(
+    export_df = final_df.copy()
+
+    for column in (
+        "hours",
+        "cumulative_hours",
+        "regular_hours",
+        "ot_hours",
+        "hourly_wage",
+        "regular_wages",
+        "ot_wages",
+        "shift_wages",
+    ):
+        export_df[column] = export_df[column].map(
+            lambda value: format(value, "f")
+        )
+
+    export_df.to_csv(
         output_path,
         index=False,
     )
@@ -1062,7 +1132,6 @@ if __name__ == "__main__":
         f"Processed CSV written to: {output_path}"
     )
 
-    # Replace the reporting week for this location in Supabase.
     write_to_supabase(
         final_df,
         location,
