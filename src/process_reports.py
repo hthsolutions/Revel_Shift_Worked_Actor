@@ -26,6 +26,11 @@ WEEKDAYS = (
     "sunday",
 )
 
+# One-off. Revel has two Hayse, Makenzie records in the same role
+# with different payroll IDs. The inactive record is 90844.
+HAYSE_DUPLICATE_NAME = "Hayse, Makenzie"
+HAYSE_DUPLICATE_PAYROLL_ID = "90844"
+
 
 # ============================================================
 # GENERAL HELPERS
@@ -557,6 +562,163 @@ def load_data(shifts_path, payroll_path):
 # ============================================================
 
 
+def payroll_row_hours(row):
+    """
+    Regular, overtime, and doubletime hours on one payroll row.
+    """
+    total = Decimal("0")
+
+    for column in (
+        "Regular h.",
+        "Overtime h.",
+        "Doubletime h.",
+    ):
+        if column not in row.index:
+            continue
+
+        value = row[column]
+
+        if pd.isna(value) or str(value).strip() == "":
+            continue
+
+        total += Decimal(str(value))
+
+    return total
+
+
+def shift_grid_row_hours(row, day_columns):
+    """
+    Hours implied by the clock ranges on one Time Worked row.
+    """
+    total = Decimal("0")
+
+    for column in day_columns:
+        cell_value = row[column]
+
+        if pd.isna(cell_value):
+            continue
+
+        for interval in str(cell_value).split(";"):
+            interval = interval.strip()
+
+            if not interval:
+                continue
+
+            start_time, end_time = parse_interval(interval)
+
+            if not start_time or not end_time:
+                continue
+
+            total += get_shift_interval_duration(
+                start_time,
+                end_time,
+            )
+
+    return total
+
+
+def exclude_hayse_duplicate_shifts(df_shifts, df_payroll):
+    """
+    Drops the Time Worked row for Hayse, Makenzie that belongs
+    to payroll ID 90844.
+
+    The shift export has no Is Active column and no employee ID.
+    Both rows use the same name and role. The inactive row is the
+    one whose clock ranges match that payroll ID's hours.
+    """
+    if (
+        "Employee" not in df_shifts.columns
+        or "Role Name" not in df_shifts.columns
+        or "Employee" not in df_payroll.columns
+        or "ID" not in df_payroll.columns
+        or "Role" not in df_payroll.columns
+    ):
+        return df_shifts
+
+    payroll_employee = df_payroll["Employee"].map(
+        lambda value: (
+            str(value).strip()
+            if pd.notna(value)
+            else ""
+        )
+    )
+    payroll_id = df_payroll["ID"].map(format_identifier)
+    payroll_role = df_payroll["Role"].map(
+        lambda value: (
+            str(value).strip()
+            if pd.notna(value)
+            else ""
+        )
+    )
+    excluded = df_payroll.loc[
+        payroll_employee.eq(HAYSE_DUPLICATE_NAME)
+        & payroll_id.eq(HAYSE_DUPLICATE_PAYROLL_ID)
+        & payroll_role.ne("")
+        & payroll_role.str.lower().ne("nan")
+    ]
+
+    if excluded.empty:
+        return df_shifts
+
+    excluded_hours = {}
+
+    for _, row in excluded.iterrows():
+        role = str(row["Role"]).strip()
+        excluded_hours[role] = excluded_hours.get(
+            role,
+            Decimal("0"),
+        ) + payroll_row_hours(row)
+
+    day_columns = identify_columns(df_shifts)
+    shift_employee = df_shifts["Employee"].map(
+        lambda value: (
+            str(value).strip()
+            if pd.notna(value)
+            else ""
+        )
+    )
+    shift_role = df_shifts["Role Name"].map(
+        lambda value: (
+            str(value).strip()
+            if pd.notna(value)
+            else ""
+        )
+    )
+    drop = pd.Series(False, index=df_shifts.index)
+
+    for index, row in df_shifts.iterrows():
+        if shift_employee.at[index] != HAYSE_DUPLICATE_NAME:
+            continue
+
+        role = shift_role.at[index]
+        target_hours = excluded_hours.get(role)
+
+        if target_hours is None or target_hours <= 0:
+            continue
+
+        row_hours = shift_grid_row_hours(row, day_columns)
+        gap = abs(row_hours - target_hours)
+
+        if gap <= Decimal("0.05"):
+            drop.at[index] = True
+            print(
+                "One-off exception: removed Time Worked "
+                f"row for {HAYSE_DUPLICATE_NAME} / {role} "
+                f"with {format(row_hours, 'f')} hours, matching "
+                f"payroll ID {HAYSE_DUPLICATE_PAYROLL_ID}."
+            )
+
+    if not drop.any():
+        print(
+            "One-off exception: payroll ID "
+            f"{HAYSE_DUPLICATE_PAYROLL_ID} was excluded, but no "
+            f"{HAYSE_DUPLICATE_NAME} Time Worked row had matching "
+            "hours."
+        )
+
+    return df_shifts.loc[~drop].copy()
+
+
 def reshape_shift_intervals(df_shifts):
     """
     Converts each clock range in the Time Worked Shifts grid into one row.
@@ -841,6 +1003,38 @@ def combine_role_wages(payroll):
     return pd.DataFrame(combined_rows)
 
 
+def exclude_hayse_duplicate_payroll(df_payroll):
+    """
+    Drops payroll rows for Hayse, Makenzie with ID 90844.
+
+    That inactive record shares a name and role with employee 91081,
+    which would otherwise stop the run as conflicting payroll IDs.
+    """
+    employee = df_payroll["Employee"].map(
+        lambda value: (
+            str(value).strip()
+            if pd.notna(value)
+            else ""
+        )
+    )
+    employee_id = df_payroll["ID"].map(format_identifier)
+    drop = (
+        employee.eq(HAYSE_DUPLICATE_NAME)
+        & employee_id.eq(HAYSE_DUPLICATE_PAYROLL_ID)
+    )
+    dropped = int(drop.sum())
+
+    if dropped:
+        print(
+            "One-off exception: removed "
+            f"{dropped} payroll row(s) for "
+            f"{HAYSE_DUPLICATE_NAME} with ID "
+            f"{HAYSE_DUPLICATE_PAYROLL_ID}."
+        )
+
+    return df_payroll.loc[~drop].copy()
+
+
 def clean_payroll(df_payroll):
     """
     Keeps one wage row per employee and role.
@@ -854,6 +1048,8 @@ def clean_payroll(df_payroll):
         ["Employee", "Role", "ID", "Wage"],
         "Payroll",
     )
+
+    df_payroll = exclude_hayse_duplicate_payroll(df_payroll)
 
     payroll = df_payroll[
         df_payroll["Employee"].notna()
@@ -1135,6 +1331,10 @@ def main(shifts_path, payroll_path, location):
         payroll_path,
     )
 
+    df_shifts = exclude_hayse_duplicate_shifts(
+        df_shifts,
+        df_payroll,
+    )
     shifts = reshape_shift_intervals(df_shifts)
     payroll = clean_payroll(df_payroll)
     shifts = attach_payroll_wages(shifts, payroll)
