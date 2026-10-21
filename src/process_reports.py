@@ -29,7 +29,7 @@ WEEKDAYS = (
 # One-off. Revel has two Hayse, Makenzie records in the same role
 # with different payroll IDs. The inactive record is 90844.
 HAYSE_DUPLICATE_NAME = "Hayse, Makenzie"
-HAYSE_DUPLICATE_PAYROLL_ID = "90844"
+HAYSE_DUPLICATE_PAYROLL_ID = "91081"
 
 
 # ============================================================
