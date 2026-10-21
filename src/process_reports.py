@@ -27,9 +27,11 @@ WEEKDAYS = (
 )
 
 # One-off. Revel has two Hayse, Makenzie records in the same role
-# with different payroll IDs. The inactive record is 90844.
+# with different payroll IDs. This run skips 91081 and ingests 90844.
+# 91081 is already stored, so the week purge leaves that ID in place.
 HAYSE_DUPLICATE_NAME = "Hayse, Makenzie"
 HAYSE_DUPLICATE_PAYROLL_ID = "91081"
+PRESERVE_EMPLOYEE_ID_ON_PURGE = "91081"
 
 
 # ============================================================
@@ -227,16 +229,19 @@ def purge_supabase_week(
     week_end,
 ):
     """
-    Deletes this location's existing rows for the reporting week.
+    Deletes this location's existing rows for the reporting week,
+    except payroll ID 91081.
 
-    An upsert alone cannot remove rows that are no longer in the report,
-    such as a shift that was deleted in Revel or re-keyed because its
-    start time, role, or payroll ID changed. Those rows would otherwise
-    survive forever as orphans.
+    Hayse, Makenzie is already stored under that ID. Those rows stay.
+    Every other employee for the location and week is removed, then
+    the new run upserts its rows. An upsert alone cannot remove rows
+    that are no longer in the report, such as a shift that was deleted
+    in Revel or re-keyed because its start time or role changed.
     """
     print(
         f"Supabase: purging existing {location} rows "
-        f"from {week_start} through {week_end}."
+        f"from {week_start} through {week_end}, "
+        f"keeping employee ID {PRESERVE_EMPLOYEE_ID_ON_PURGE}."
     )
 
     response = (
@@ -246,6 +251,7 @@ def purge_supabase_week(
         .eq("location", location)
         .gte("date", week_start)
         .lte("date", week_end)
+        .neq("employee_id", PRESERVE_EMPLOYEE_ID_ON_PURGE)
         .execute()
     )
 
@@ -267,8 +273,9 @@ def write_to_supabase(
     """
     Replaces the reporting week for one location in Supabase.
 
-    Existing rows for the location/week are purged first, then the final
-    processed dataframe is upserted in batches.
+    Existing rows for the location/week are purged first, except
+    employee ID 91081, then the final processed dataframe is upserted
+    in batches.
 
     Required Apify runtime environment variables:
         SUPABASE_URL
