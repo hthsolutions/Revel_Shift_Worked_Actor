@@ -26,7 +26,8 @@
       "enum": [
         "Leander",
         "Marble Falls",
-        "Lampasas"
+        "Lampasas",
+        "Temple"
       ],
       "default": "Leander"
     },
